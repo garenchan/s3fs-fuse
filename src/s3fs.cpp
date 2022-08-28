@@ -1035,20 +1035,154 @@ static int s3fs_unlink(const char* _path)
     return result;
 }
 
+// Query a maximum of 10 keywords at a time, and then check whether the directories in them exist.
+// There may be only one more HEAD request, which normally has a small impact on performance.
 static int directory_empty(const char* path)
 {
-    int result;
-    S3ObjList head;
+    std::string s3_realpath;
+    std::string query_delimiter;
+    std::string query_prefix;
+    std::string query_maxkey = "max-keys=10";
+    std::string next_continuation_token;
+    std::string next_marker;
+    bool truncated = true;
+    S3fsCurl  s3fscurl;
+    xmlDocPtr doc;
+    const char* delimiter = "/";
 
-    if((result = list_bucket(path, head, "/", true)) != 0){
-        S3FS_PRN_ERR("list_bucket returns error.");
-        return result;
+    S3FS_PRN_INFO1("[path=%s]", path);
+
+    if(delimiter && 0 < strlen(delimiter)){
+        query_delimiter += "delimiter=";
+        query_delimiter += delimiter;
+        query_delimiter += "&";
     }
-    if(!head.IsEmpty()){
-        return -ENOTEMPTY;
+
+    query_prefix += "&prefix=";
+    s3_realpath = get_realpath(path);
+    if(s3_realpath.empty() || '/' != *s3_realpath.rbegin()){
+        // last word must be "/"
+        query_prefix += urlEncode(s3_realpath.substr(1) + "/");
+    }else{
+        query_prefix += urlEncode(s3_realpath.substr(1));
     }
+
+    while(truncated){
+        // append parameters to query in alphabetical order
+        std::string each_query;
+        if(!next_continuation_token.empty()){
+            each_query += "continuation-token=" + urlEncode(next_continuation_token) + "&";
+            next_continuation_token = "";
+        }
+        each_query += query_delimiter;
+        if(S3fsCurl::IsListObjectsV2()){
+            each_query += "list-type=2&";
+        }
+        if(!next_marker.empty()){
+            each_query += "marker=" + urlEncode(next_marker) + "&";
+            next_marker = "";
+        }
+        each_query += query_maxkey;
+        each_query += query_prefix;
+
+        // request
+        int result;
+        if(0 != (result = s3fscurl.ListBucketRequest(path, each_query.c_str()))){
+            S3FS_PRN_ERR("ListBucketRequest returns with error.");
+            return result;
+        }
+        BodyData* body = s3fscurl.GetBodyData();
+
+        // xmlDocPtr
+        if(NULL == (doc = xmlReadMemory(body->str(), static_cast<int>(body->size()), "", NULL, 0))){
+            S3FS_PRN_ERR("xmlReadMemory returns with error.");
+            return -EIO;
+        }
+
+        S3ObjList head;
+        if(0 != append_objects_from_xml(path, doc, head)){
+            S3FS_PRN_ERR("append_objects_from_xml returns with error.");
+            xmlFreeDoc(doc);
+            return -EIO;
+        }
+
+        s3obj_list_t headlist;
+        head.GetNameList(headlist, true, false);
+        // Check whether the directory is deleted
+        for(s3obj_list_t::iterator iter = headlist.begin(); headlist.end() != iter; ++iter){
+            if(head.IsDir((*iter).c_str())){
+                std::string strpath = path;
+                if(strpath.empty() || *delimiter != *strpath.rbegin()){
+                    strpath += delimiter;
+                }
+                strpath += *iter;
+
+                StatCache::getStatCacheData()->DelStat(strpath);
+                int result = get_object_attribute(strpath.c_str(), NULL);
+                if(result == 0){
+                    xmlFreeDoc(doc);
+                    return -ENOTEMPTY;
+                }else if(result != -ENOENT){
+                    xmlFreeDoc(doc);
+                    return result;
+                }
+            }else{
+                xmlFreeDoc(doc);
+                return -ENOTEMPTY;
+            }
+        }
+
+        if(true == (truncated = is_truncated(doc))){
+            xmlChar* tmpch;
+            if(NULL != (tmpch = get_next_continuation_token(doc))){
+                next_continuation_token = reinterpret_cast<char*>(tmpch);
+                xmlFree(tmpch);
+            }else if(NULL != (tmpch = get_next_marker(doc))){
+                next_marker = reinterpret_cast<char*>(tmpch);
+                xmlFree(tmpch);
+            }
+
+            if(next_continuation_token.empty() && next_marker.empty()){
+                // If did not specify "delimiter", s3 did not return "NextMarker".
+                // On this case, can use last name for next marker.
+                //
+                std::string lastname;
+                if(!head.GetLastName(lastname)){
+                    S3FS_PRN_WARN("Could not find next marker, thus break loop.");
+                    truncated = false;
+                }else{
+                    next_marker = s3_realpath.substr(1);
+                    if(s3_realpath.empty() || '/' != *s3_realpath.rbegin()){
+                        next_marker += "/";
+                    }
+                    next_marker += lastname;
+                }
+            }
+        }
+        S3FS_XMLFREEDOC(doc);
+
+        // reset(initialize) curl object
+        s3fscurl.DestroyCurlHandle();
+    }
+    S3FS_MALLOCTRIM(0);
+
     return 0;
 }
+
+//static int directory_empty(const char* path)
+//{
+//    int result;
+//    S3ObjList head;
+//
+//    if((result = list_bucket(path, head, "/", true)) != 0){
+//        S3FS_PRN_ERR("list_bucket returns error.");
+//        return result;
+//    }
+//    if(!head.IsEmpty()){
+//        return -ENOTEMPTY;
+//    }
+//    return 0;
+//}
 
 static int s3fs_rmdir(const char* _path)
 {
@@ -2623,7 +2757,8 @@ static bool multi_head_callback(S3fsCurl* s3fscurl, void* param)
             pcbparam->filler(pcbparam->buf, bpath.c_str(), &st, 0);
         }else{
             S3FS_PRN_INFO2("Could not find %s file in stat cache.", saved_path.c_str());
-            pcbparam->filler(pcbparam->buf, bpath.c_str(), 0, 0);
+            // It could be a deleted directory, so don't return it?
+            //pcbparam->filler(pcbparam->buf, bpath.c_str(), 0, 0);
         }
     }else{
         S3FS_PRN_WARN("param(fuse_fill_dir_t filler) is NULL, then can not call filler.");
@@ -2696,12 +2831,15 @@ static int readdir_multi_head(const char* path, const S3ObjList& head, void* buf
     for(iter = headlist.begin(); headlist.end() != iter; iter = headlist.erase(iter)){
         std::string disppath = path + (*iter);
         std::string etag     = head.GetETag((*iter).c_str());
+        bool is_dir          = head.IsDir((*iter).c_str());
         struct stat st;
 
         // [NOTE]
         // If there is a cache hit, file stat is filled by filler at here.
         //
-        if(StatCache::getStatCacheData()->HasStat(disppath, &st, etag.c_str())){
+        // If it is a directory, do not use the cache, because it may have been deleted.
+        // We may need to add a switch such as "disable_dir_cache" to control whether directories are cached or not?
+        if(!is_dir && StatCache::getStatCacheData()->HasStat(disppath, &st, etag.c_str())){
             std::string bpath = mybasename(disppath);
             if(use_wtf8){
                 bpath = s3fs_wtf8_decode(bpath);
