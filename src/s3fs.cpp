@@ -769,6 +769,17 @@ static int s3fs_getattr(const char* _path, struct stat* stbuf)
 
     S3FS_PRN_INFO("[path=%s]", path);
 
+    // [NOTE]
+    // Delete the Stats cache only if the file is not open.
+    // If the file is open, the stats cache will not be deleted as
+    // there are cases where the object does not exist on the server
+    // and only the Stats cache exists.
+    if(StatCache::getStatCacheData()->HasStat(path)){
+        if(!FdManager::HasOpenEntityFd(path)){
+            StatCache::getStatCacheData()->DelStat(path);
+        }
+    }
+
     // check parent directory attribute.
     if(0 != (result = check_parent_object_access(path, X_OK))){
         return result;
